@@ -1,0 +1,171 @@
+---
+title: "ProjectReport"
+output: html_document
+---
+
+This puprose of this document is to outline the steps undertaken during the Course Project for the Practical Machine Learning module on the Coursera Data Science Specialisation. The goal of the project was to predict the manner of exercise (classe) in the pml-training dataset, available from https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv. 
+
+A Random Forest, with 5 fold cross validation was used to train the model. The **out-of-sample error is estimated to be 0.82%, or an accuracy of 99.18%**. The R script *trainAndTest.R* contains the code described in this document. The sections below describe:
+
+* Data retrieval and loading
+* Feature selection
+* Data pre-processing
+* Model building 
+* The use of cross validation
+* The expected ou of sample error 
+
+## Step 1: Load libraries
+The *caret* library is used to create train and test the model. Additionally, to speed up the training process, the library *doParallel* is used to assign more cpu to the process. The use of this library is optional, depending on the system specification you are using. Also, this script requires the randomForest library.
+
+```{r}
+library(caret)
+library(doParallel)
+registerDoParallel(cores=2)
+require(randomForest)
+```
+
+## Step 2: Getting and Loading the training data
+The next step is to load the training data into R. The script contains two functions to do this. The first, *checkAndDownloadFiles* checks to see if a data folder exists in the current working directory and if it contains the training and testing csv files. If not, it creates the data folder and downloads both files.
+
+```{r}
+checkAndDownloadFiles <- function(){
+  ## First check if data folder exists
+  if (!dir.exists("data")){
+    dir.create(path = "data")
+  }
+  if (!file.exists("data/pml-training.csv")){
+    fileURL = "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+    download.file(url = fileURL, destfile = "data/pml-training.csv", method="curl")
+  }
+  if (!file.exists("data/pml-testing.csv")){
+    fileURL = "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+    download.file(url = fileURL, destfile = "data/pml-testing.csv", method="curl")
+  }
+}
+```
+
+The second function, *readInTrainingData*, loads the training data, pml_training.csv, into R. From examining the raw data there are alot of columns with blank and weird text such *#DIV/0!*. Such data values are set to *NA* during the reading process.
+
+```{r}
+readInTrainingData <- function(){
+  filename <- "data/pml-training.csv"
+  training <- read.table(filename, sep=",", skip=0, header=TRUE, 
+                         na.strings=c("NA","NaN",""," ","#DIV/0!"))
+  return (training)
+}
+```
+
+Having defined these two helper functions, we next use them to load the data:
+```{r}
+checkAndDownloadFiles()
+allTrainingData <- readInTrainingData() 
+```
+
+## Step 3: Partition the data
+Next, the training data is split into a training and test dataset. This is done using the *createTrainTest* function. This function splits the data randomly, with seed **41282**, with 70% of the data being used to train the data and 30% set aside as a test dataset. It returns a list containing both the training and testing paritions.
+
+```{r}
+createTrainTest <- function(theData){
+  set.seed(41282)
+  inTrain <- createDataPartition(y = theData$classe, p=.70, list=FALSE)
+  training <- theData[inTrain,]
+  testing <- theData[-inTrain,]
+  return (list(training = training, testing = testing))
+}
+
+datasets <- createTrainTest(allTrainingData)
+training <- datasets$training
+```
+
+## Step 4: Feature selection
+The raw data begins with 160 features, including *classe*, which we want to predict. This gives us 159 possible predictors to use. However, some of the features don't contain useful information and using all 159 predictors may make our training very slow. This section describes how the training set was cut from 159 predictors to 34.
+
+### A. Remove NA Values
+The raw data contains 160 variables, alot of which are most *NA* values. So to begin, we remove features from the data that are mostly *NA* with a 50% threshold being used. This may have necessitated further examination, perhaps with a stricter threshold, however, as can be seen, it successful in removing all NA values from the data.
+
+```{r, eval=TRUE}
+training <- training[,colSums(is.na(training)) < nrow(training) * 0.5]
+any(is.na(training))
+```
+
+This reduces the number of predictors from 159 to 59.
+
+### B. Remove column relating to Index, timestamps and windows
+Examining the raw data, it can be seen that the first 7 features contain information relating to an index, variable *X*, the user's name, time stamps and sliding observation windows. This is problematic as the variable we wish to predict, *classe*, is ordered in the dataset. This can be observed in the following plot where *X*, the index, is plotted against *classe*.
+
+```{r, echo=FALSE}
+qplot(data=training, x=X, y=classe, main = "classe vs. X")
+```
+
+There is not the same relationship for the observation window data, however this data is not generalisable across potential future experiments i.e. if we ran the same experiment again the choise of observation window numbers would be arbitrary. As a result, I exclude these 7 features from the training set.
+
+```{r}
+training <- training[,-(1:7)]
+```
+
+This reduces the number of predictors from 59 to 52.
+
+### C. Remove redundant columns
+The final feature selection step is an attempt to see if there are any redundant features left in the training set. Redundant features, in this case, are defined as features that are highly correlated with other features and so they do not give any/much additional information. The caret function *findCorrlation* is used with a threshold of 0.75 to find highly correlated features, with the redundant features removed. Of course, we don't want to exclude *classe*, so we exclude this from the correlation test. 
+```{r}
+descrCor <- cor(training[,-ncol(training)])
+highlyCorDescr <- findCorrelation(descrCor, cutoff = .75)
+training <- training[,-highlyCorDescr]
+```
+
+This final step reduces the number of predictors to 34. 
+
+## Step 5: Training the Model
+The model is trained using random forest, in order to predict the *classe* variable. Additionally, a preprocess step was added to scale and center the features. Finally, a 5 fold cross-validation was used during the training process. As the cross-validation is random, a seed of *360* is set to ensure repeatability.
+
+As with downloading and reading the data above, to the script first checks to see if the model training has already been done, and if the model was saved to the working directory. If the model is in the working directory, it is loaded back in, without the need to re-train. This is done due to the long time it takes to train the model. 
+
+```{r}
+lastCol <- ncol(training)
+preProc.Norm <- preProcess(training[,-lastCol],method=c("center","scale"))
+  
+train.Norm <- predict(preProc.Norm, training[,-lastCol])
+  
+set.seed(360)
+if(!file.exists("model_Norm.Rds")){
+  print("Model file for Center+Scale not found. About to train new model. 
+          Go get a coffee, this will take a while")
+  modelFit.Norm <- train(training$classe ~., method="rf" ,data=train.Norm,
+                      trControl=trainControl(method="cv",number=5),
+                      prox=TRUE,allowParallel=TRUE)
+  saveRDS(modelFit.Norm, "model_Norm.Rds")
+  registerDoParallel(cores=1)
+}else{
+  print("Loading Ceneter+Scale model")
+  modelFit.Norm <- readRDS("model_Norm.Rds") 
+}
+```
+
+Having done the training, the caret package provides an OOB (out of bag/out of sample) estimate of the error rate of 0.76%. As a result, accuracy is predicted to be 99.24%.
+
+```{r}
+print(modelFit.Norm$finalModel)
+```
+
+## Step 6: Applying model to the test partition
+Having kept 30% of the training data aside, the next step is to apply the model to this to test set. This requires that the testing set is processed to have the same features and same pre-processing steps as done to the training set. 
+
+```{r}
+testing <- datasets$testing
+testing <- testing[,names(training)]
+test.Norm <- predict(preProc.Norm, testing[,-lastCol])
+preds <- predict(modelFit.Norm, test.Norm)
+testing$predRight <- preds == testing$classe
+```
+
+We can now print a table of the predictions to see how the model performed. 
+```{r}
+table(preds, testing$classe)
+```
+
+Finally, we can check the accuracy on the test set.
+```{r}
+print(nrow(testing[testing$predRight == TRUE,]) / nrow(testing))
+```
+
+The accuracy is 99.18%, which is slightly lower than the 99.24% predicted by the Caret package using bagging and cross validation. It's approximately the same, but gives a more realistic estimate of the true out-of-sample accuracy or error, as random forest can suffer from overfitting. **Therefore, I conclude that 0.82% is the out-of-sample error**.
